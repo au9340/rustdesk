@@ -1,6 +1,11 @@
 # This yaml shares the build bridge steps with ci and nightly.
 name: Build flutter-rust-bridge
 # 2023-11-23 18:00:00+00:00
+#
+# fork: 只保留默认的 bridge-artifact（Flutter 3.22.3 生成，给 Flutter 3.24.5 的平台用，
+# 包括 Android）。上游额外那条 bridge-artifact-flutter-3.44 只有 Windows-ARM64 /
+# macOS-ARM64 用得上，本 fork 只构建 Android，已删掉以省掉约 8~10 分钟陪跑时间。
+# 如果以后要构建 Windows-ARM64 / macOS-ARM64，把下面注释掉的那条 matrix 条目加回来。
 
 on:
   workflow_call:
@@ -25,14 +30,13 @@ jobs:
               flutter-version: "3.22.3",
               artifact-name: "bridge-artifact",
             }
-          # Dedicated bridge for the Windows and macOS arm64 builds (Flutter 3.44); runs in parallel.
-          - {
-              target: x86_64-unknown-linux-gnu,
-              os: ubuntu-22.04,
-              extra-build-args: "",
-              flutter-version: "3.44.8",
-              artifact-name: "bridge-artifact-flutter-3.44",
-            }
+          # - {
+          #     target: x86_64-unknown-linux-gnu,
+          #     os: ubuntu-22.04,
+          #     extra-build-args: "",
+          #     flutter-version: "3.44.8",
+          #     artifact-name: "bridge-artifact-flutter-3.44",
+          #   }
     steps:
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
