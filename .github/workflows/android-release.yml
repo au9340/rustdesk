@@ -1,7 +1,8 @@
 # 仅 Android 的发布流水线（精简自上游 flutter-build.yml 的 build-rustdesk-android）。
 #
 # 触发：任意分支 push 都会构建，Actions 页面也可手动 Run workflow。
-#       → 想只让某条分支生效，把 `on.push` 换回 `branches: [android-release]`。
+#       → 想只让某条分支生效，把 `on.push` 换回 `branches: [android-release]`；
+#       → 想让文档类改动不触发，加 `paths-ignore: ['**.md', 'docs/**']`。
 #
 # 产物：单个 arm64-v8a APK，签名后直接建 Release。
 #
@@ -79,6 +80,34 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
+
+      # 放在最前面：缺 secret 时 5 秒内失败，而不是白等一小时编译完才报错。
+      # 关键：不要像上游那样把 signingConfigs.release 改成 debug。
+      # build.gradle 本来就支持从 flutter/android/key.properties 读 release 签名，
+      # 只要把固定 keystore 写进去，产出的 APK 每次签名一致，才能覆盖安装。
+      - name: Configure release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64}" ]; then
+            echo "::error::缺少签名密钥，无法产出可覆盖安装的 APK。"
+            echo "::error::请在 Settings → Secrets and variables → Actions 添加："
+            echo "::error::  ANDROID_SIGNING_KEY / ANDROID_KEY_STORE_PASSWORD / ANDROID_KEY_PASSWORD / ANDROID_ALIAS"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.jks"
+          cat > flutter/android/key.properties <<EOF
+          storePassword=${STORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          storeFile=$GITHUB_WORKSPACE/release.jks
+          EOF
+          sed 's/^/  /' flutter/android/key.properties | sed 's/\(storePassword=\).*/\1***/;s/\(keyPassword=\).*/\1***/'
 
       - name: Install dependencies
         run: |
@@ -178,33 +207,6 @@ jobs:
              flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
           cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
              flutter/android/app/src/main/jniLibs/arm64-v8a/
-
-      # 关键：不要像上游那样把 signingConfigs.release 改成 debug。
-      # build.gradle 本来就支持从 flutter/android/key.properties 读 release 签名，
-      # 只要把固定 keystore 写进去，产出的 APK 每次签名一致，才能覆盖安装。
-      - name: Configure release signing
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEY }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${KEYSTORE_BASE64}" ]; then
-            echo "::error::缺少签名密钥，无法产出可覆盖安装的 APK。"
-            echo "::error::请在 Settings → Secrets and variables → Actions 添加："
-            echo "::error::  ANDROID_SIGNING_KEY / ANDROID_KEY_STORE_PASSWORD / ANDROID_KEY_PASSWORD / ANDROID_ALIAS"
-            exit 1
-          fi
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.jks"
-          cat > flutter/android/key.properties <<EOF
-          storePassword=${STORE_PASSWORD}
-          keyPassword=${KEY_PASSWORD}
-          keyAlias=${KEY_ALIAS}
-          storeFile=$GITHUB_WORKSPACE/release.jks
-          EOF
-          sed 's/^/  /' flutter/android/key.properties | sed 's/\(storePassword=\).*/\1***/;s/\(keyPassword=\).*/\1***/'
 
       - name: Build signed arm64 APK
         env:
