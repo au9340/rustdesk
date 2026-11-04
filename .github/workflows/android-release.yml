@@ -1,5 +1,9 @@
 # 仅 Android 的发布流水线（精简自上游 flutter-build.yml 的 build-rustdesk-android）。
 #
+# 当前状态：ANDROID_SIGNING_KEY / ANDROID_KEY_STORE_PASSWORD / ANDROID_KEY_PASSWORD /
+#           ANDROID_ALIAS 四个 secret 已配置 → 走第 ① 级签名，
+#           每次构建的证书 SHA-256 应当一致（可覆盖更新）。
+#
 # 触发：任意分支 push 都会构建，Actions 页面也可手动 Run workflow。
 #       → 想只让某条分支生效，把 `on.push` 换回 `branches: [android-release]`；
 #       → 想让文档类改动不触发，加 `paths-ignore: ['**.md', 'docs/**']`。
@@ -27,6 +31,10 @@
 #   ANDROID_KEY_STORE_PASSWORD  = keystore 密码
 #   ANDROID_KEY_PASSWORD        = key 密码
 #   ANDROID_ALIAS               = key 别名
+#
+# 自检：构建完成后看 "Verify signature and versionCode" 步骤打印的
+#       "Signer #1 certificate SHA-256 digest"。这个值每次都必须相同；
+#       变了说明 secret 没读到、回退成 debug 签名了（日志里会有 warning）。
 #
 # ⚠ 手机上如果装的是官方 RustDesk（官方 keystore 签的），首次必须卸载重装，
 #   签名不同无法覆盖；之后所有同签名版本之间可以互相覆盖。
