@@ -1,10 +1,9 @@
 # 仅 Android 的发布流水线（精简自上游 flutter-build.yml 的 build-rustdesk-android）。
 #
-# 触发：
-#   - push 到 android-release 分支
-#   - Actions 页面手动 Run workflow
+# 触发：任意分支 push 都会构建，Actions 页面也可手动 Run workflow。
+#       → 想只让某条分支生效，把 `on.push` 换回 `branches: [android-release]`。
 #
-# 产物：一个 universal APK（arm64-v8a + armeabi-v7a），签名后直接建 Release。
+# 产物：单个 arm64-v8a APK，签名后直接建 Release。
 #
 # 「可覆盖更新」需要同时满足两个条件，这里都保证了：
 #   1. 每次用同一把 keystore 签名（secrets.ANDROID_SIGNING_KEY），
@@ -28,15 +27,15 @@ name: Android Release
 
 on:
   push:
-    branches: [android-release]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: android-release
-  cancel-in-progress: false # 不要半路取消，避免发布出半成品
+  # 带上 ref，不同分支互不干扰；同一分支保持串行，避免发布出半成品
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   VERSION: "1.5.1"
@@ -140,14 +139,12 @@ jobs:
           doNotCache: false
 
       # 编译 Android 依赖（libvpx/ffmpeg/openssl/aom 等），走 vcpkg，缓存命中时会快很多。
-      - name: Build Android deps
+      - name: Build Android deps (arm64-v8a)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         shell: bash
-        run: |
-          ./flutter/build_android_deps.sh arm64-v8a
-          ./flutter/build_android_deps.sh armeabi-v7a
+        run: ./flutter/build_android_deps.sh arm64-v8a
 
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -159,14 +156,14 @@ jobs:
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          targets: aarch64-linux-android,armv7-linux-androideabi
+          targets: aarch64-linux-android
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: rustdesk-lib-cache-android
-          key: android-universal
+          key: android-arm64
 
-      - name: Build librustdesk.so (arm64-v8a + armeabi-v7a)
+      - name: Build librustdesk.so (arm64-v8a)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -175,18 +172,12 @@ jobs:
           set -euo pipefail
           cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
           ./flutter/ndk_arm64.sh
-          ./flutter/ndk_arm.sh
 
-          mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a \
-                   flutter/android/app/src/main/jniLibs/armeabi-v7a
+          mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
           cp target/aarch64-linux-android/release/liblibrustdesk.so \
              flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
-          cp target/armv7-linux-androideabi/release/liblibrustdesk.so \
-             flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
           cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
              flutter/android/app/src/main/jniLibs/arm64-v8a/
-          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libc++_shared.so" \
-             flutter/android/app/src/main/jniLibs/armeabi-v7a/
 
       # 关键：不要像上游那样把 signingConfigs.release 改成 debug。
       # build.gradle 本来就支持从 flutter/android/key.properties 读 release 签名，
@@ -215,7 +206,7 @@ jobs:
           EOF
           sed 's/^/  /' flutter/android/key.properties | sed 's/\(storePassword=\).*/\1***/;s/\(keyPassword=\).*/\1***/'
 
-      - name: Build signed universal APK
+      - name: Build signed arm64 APK
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           VERSION_CODE: ${{ github.run_number }}
@@ -227,13 +218,13 @@ jobs:
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx4g/g" ./flutter/android/gradle.properties
           pushd flutter
           flutter build apk --release \
-            --target-platform android-arm64,android-arm \
+            --target-platform android-arm64 \
             --build-name="${VERSION}" \
             --build-number="${VERSION_CODE}"
           popd
           mkdir -p out
           cp ./flutter/build/app/outputs/flutter-apk/app-release.apk \
-             ./out/RustDesk-android-universal.apk
+             ./out/RustDesk-android-arm64.apk
           ls -lh ./out
 
       - name: Verify signature and versionCode
@@ -242,16 +233,16 @@ jobs:
           set -euo pipefail
           BT=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
           echo "build-tools: $BT"
-          "$BT/apksigner" verify --print-certs ./out/RustDesk-android-universal.apk | tee /tmp/certs.txt
+          "$BT/apksigner" verify --print-certs ./out/RustDesk-android-arm64.apk | tee /tmp/certs.txt
           # 证书 SHA-256 应当每次构建都一样；不一样说明 keystore 变了，无法覆盖更新
           grep -i 'SHA-256 digest' /tmp/certs.txt
-          "$BT/aapt" dump badging ./out/RustDesk-android-universal.apk | head -1
+          "$BT/aapt" dump badging ./out/RustDesk-android-arm64.apk | head -1
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-android-universal
-          path: ./out/RustDesk-android-universal.apk
+          name: rustdesk-android-arm64
+          path: ./out/RustDesk-android-arm64.apk
           if-no-files-found: error
 
       - name: Publish release
@@ -269,11 +260,12 @@ jobs:
 
             - 版本名：`${{ env.VERSION }}`
             - versionCode：`${{ github.run_number }}`
+            - ABI：arm64-v8a
+            - 分支：`${{ github.ref_name }}`
             - 提交：${{ github.sha }}
-            - ABI：arm64-v8a + armeabi-v7a（universal）
 
             固定下载地址（永远是最新版）：
-            `https://github.com/${{ github.repository }}/releases/latest/download/RustDesk-android-universal.apk`
+            `https://github.com/${{ github.repository }}/releases/latest/download/RustDesk-android-arm64.apk`
 
             覆盖安装前提：与上一版使用同一把签名密钥，且 versionCode 不小于已安装版本。
-          files: ./out/RustDesk-android-universal.apk
+          files: ./out/RustDesk-android-arm64.apk
