@@ -6,23 +6,30 @@
 #
 # 产物：单个 arm64-v8a APK，签名后直接建 Release。
 #
-# 「可覆盖更新」需要同时满足两个条件，这里都保证了：
-#   1. 每次用同一把 keystore 签名（secrets.ANDROID_SIGNING_KEY），
-#   2. versionCode 单调递增（用 github.run_number 作为 --build-number）。
-#   ⚠ 如果手机上装的是官方 RustDesk（官方 keystore 签的），首次必须卸载重装，
-#     签名不同无法覆盖；之后所有自编译版本之间可以互相覆盖。
+# 签名策略（三级回退，见 "Configure signing" 步骤）：
+#   1. secrets.ANDROID_SIGNING_KEY 有值  → 用它。签名稳定 + 私钥只有你有 → 可覆盖更新 ✅
+#   2. 仓库里存在 android/debug.keystore → 用它。签名稳定 → 可覆盖更新 ✅（但私钥在仓库里）
+#   3. 以上都没有                        → sed 成 debug 签名。能跑，但 runner 的 debug key
+#                                          每次构建都可能重新生成 → 签名不同 → 手机上必须
+#                                          卸载重装，无法覆盖更新 ❌
 #
-# 需要的仓库 Secrets（Settings → Secrets and variables → Actions）：
-#   ANDROID_SIGNING_KEY         = base64 -w0 后的 keystore 文件内容
+# 想从 3 升级到 2（不配 secret 也能覆盖更新）：本地生成后提交进仓库
+#   keytool -genkeypair -keystore android/debug.keystore -storetype PKCS12 \
+#     -alias androiddebugkey -storepass android -keypass android \
+#     -keyalg RSA -keysize 2048 -validity 10000 \
+#     -dname "CN=Android Debug,O=Android,C=US"
+#   git add android/debug.keystore && git commit -m "chore: 固定签名密钥" && git push
+#   ⚠ 这个仓库是 public fork，提交进去等于公开私钥：谁都能签一个能覆盖你安装的 APK。
+#     介意的话就走第 1 级，用 secret 存真 keystore。
+#
+# 想用第 1 级：Settings → Secrets and variables → Actions 添加
+#   ANDROID_SIGNING_KEY         = base64 -w0 release.jks
 #   ANDROID_KEY_STORE_PASSWORD  = keystore 密码
 #   ANDROID_KEY_PASSWORD        = key 密码
 #   ANDROID_ALIAS               = key 别名
 #
-# 生成 keystore：
-#   keytool -genkeypair -v -keystore release.jks -alias rustdesk \
-#     -keyalg RSA -keysize 2048 -validity 10000 -storetype PKCS12
-#   base64 -w0 release.jks      # 把输出贴进 ANDROID_SIGNING_KEY
-#   备份 release.jks —— 丢了就再也不能覆盖更新，只能卸载重装。
+# ⚠ 手机上如果装的是官方 RustDesk（官方 keystore 签的），首次必须卸载重装，
+#   签名不同无法覆盖；之后所有同签名版本之间可以互相覆盖。
 
 name: Android Release
 
@@ -81,11 +88,8 @@ jobs:
         with:
           submodules: recursive
 
-      # 放在最前面：缺 secret 时 5 秒内失败，而不是白等一小时编译完才报错。
-      # 关键：不要像上游那样把 signingConfigs.release 改成 debug。
-      # build.gradle 本来就支持从 flutter/android/key.properties 读 release 签名，
-      # 只要把固定 keystore 写进去，产出的 APK 每次签名一致，才能覆盖安装。
-      - name: Configure release signing
+      # 放在最前面：签名配置失败时秒挂，而不是白等一小时编译完才报错。
+      - name: Configure signing
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEY }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
@@ -94,18 +98,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${KEYSTORE_BASE64}" ]; then
-            echo "::error::缺少签名密钥，无法产出可覆盖安装的 APK。"
-            echo "::error::请在 Settings → Secrets and variables → Actions 添加："
-            echo "::error::  ANDROID_SIGNING_KEY / ANDROID_KEY_STORE_PASSWORD / ANDROID_KEY_PASSWORD / ANDROID_ALIAS"
-            exit 1
+          COMMITTED_KS="$GITHUB_WORKSPACE/android/debug.keystore"
+
+          if [ -n "${KEYSTORE_BASE64}" ]; then
+            # ① 真 keystore（推荐）：签名稳定，私钥只有仓库管理员能看到
+            echo "::notice::签名方式：secrets.ANDROID_SIGNING_KEY"
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.jks"
+            KS="$GITHUB_WORKSPACE/release.jks"
+            STORE_PASS="${STORE_PASSWORD}"
+            KEY_PASS="${KEY_PASSWORD}"
+          elif [ -f "$COMMITTED_KS" ]; then
+            # ② 仓库里的固定 debug keystore：签名稳定，但私钥是公开的
+            echo "::notice::签名方式：仓库内 android/debug.keystore"
+            KS="$COMMITTED_KS"
+            STORE_PASS="android"
+            KEY_PASS="android"
+            KEY_ALIAS="androiddebugkey"
+          else
+            # ③ 兜底：直接改用 Gradle 的 debug 签名（上游 CI 也是这么干的）
+            echo "::warning::没有 ANDROID_SIGNING_KEY，也没有 android/debug.keystore，本次使用 runner 的 debug 签名。"
+            echo "::warning::runner 的 debug key 每次构建可能重新生成 → 签名会变 → 手机上必须卸载重装，不能覆盖更新。"
+            echo "::warning::想固定签名：本地 keytool 生成 android/debug.keystore 并提交，或配置 ANDROID_SIGNING_KEY secret。"
+            sed -i "s/signingConfigs.release/signingConfigs.debug/g" flutter/android/app/build.gradle
+            exit 0
           fi
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.jks"
+
+          # build.gradle 本来就支持从 flutter/android/key.properties 读 release 签名，
+          # 不要像上游那样无条件 sed 成 debug —— 那样每次签名都不一样。
           cat > flutter/android/key.properties <<EOF
-          storePassword=${STORE_PASSWORD}
-          keyPassword=${KEY_PASSWORD}
+          storePassword=${STORE_PASS}
+          keyPassword=${KEY_PASS}
           keyAlias=${KEY_ALIAS}
-          storeFile=$GITHUB_WORKSPACE/release.jks
+          storeFile=${KS}
           EOF
           sed 's/^/  /' flutter/android/key.properties | sed 's/\(storePassword=\).*/\1***/;s/\(keyPassword=\).*/\1***/'
 
@@ -236,8 +260,8 @@ jobs:
           BT=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
           echo "build-tools: $BT"
           "$BT/apksigner" verify --print-certs ./out/RustDesk-android-arm64.apk | tee /tmp/certs.txt
-          # 证书 SHA-256 应当每次构建都一样；不一样说明 keystore 变了，无法覆盖更新
-          grep -i 'SHA-256 digest' /tmp/certs.txt
+          # 证书 SHA-256 固定 → 可覆盖安装；每次都变 → 只能卸载重装
+          grep -i 'SHA-256 digest' /tmp/certs.txt || true
           "$BT/aapt" dump badging ./out/RustDesk-android-arm64.apk | head -1
 
       - name: Upload artifact
@@ -258,7 +282,7 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: true
           body: |
-            RustDesk Android 自编译版（直接安装，可覆盖上一版）
+            RustDesk Android 自编译版
 
             - 版本名：`${{ env.VERSION }}`
             - versionCode：`${{ github.run_number }}`
@@ -269,5 +293,6 @@ jobs:
             固定下载地址（永远是最新版）：
             `https://github.com/${{ github.repository }}/releases/latest/download/RustDesk-android-arm64.apk`
 
-            覆盖安装前提：与上一版使用同一把签名密钥，且 versionCode 不小于已安装版本。
+            覆盖安装前提：与已装版本**签名相同**，且 versionCode 不小于已安装版本。
+            若本次是 runner 临时 debug 签名（日志里会 warning），则必须卸载重装。
           files: ./out/RustDesk-android-arm64.apk
