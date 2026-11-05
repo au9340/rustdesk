@@ -25,6 +25,7 @@ import '../../models/shortcut_model.dart';
 import '../../utils/image.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
+import '../widgets/local_cursor.dart';
 
 final initText = '1' * 1024;
 
@@ -381,7 +382,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       oldValue = '';
     }
     // This length-only diff assumes the IME appends at the end. If an IME
-    // leaves the caret inside paired punctuation, later insertions can replay
+    // leaves the caret inside paired punctuation, later insertions replay
     // the closing symbol: "()" -> "(a)" sends ")" instead of "a". This is a
     // client text-diff issue, independent of the host keyboard layout.
     if (newValue.length == oldValue.length) {
@@ -701,7 +702,15 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     );
   }
 
+  /// fork: 移动端不再绘制「远端回报位置」的光标。
+  ///
+  /// 被控端视频帧里不包含光标（`scrap::is_cursor_embedded()` 在非 X11 恒 false），
+  /// 屏幕上的指针只能由客户端画；而这里用的是服务端 `CursorPosition` 回报的位置，
+  /// 等于把 1~2 个 RTT 塞进视觉回路，还会和虚拟鼠标面板自带的本地光标叠成两个箭头。
+  /// 移动端改由 [LocalCursorPaint] 按本地位置绘制，见 `getBodyForMobile`。
+  /// 注意：桌面端必须保留原逻辑，视频里没有光标，少画就彻底没指针了。
   bool get showCursorPaint =>
+      !isMobile &&
       !gFFI.ffiModel.isPeerAndroid &&
       !gFFI.canvasModel.cursorEmbedded &&
       !gFFI.inputModel.relativeMouseMode.value;
@@ -750,7 +759,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       // en/fr input method:
                       //      1. The button will not trigger `onKeyEvent` if the text field is not empty.
                       //      2. The button will trigger `onKeyEvent` if the text field is empty.
-                      // ko/zh/ja input method: the button will trigger `onKeyEvent`
+                      // ko/zh/ja input method: The button will trigger `onKeyEvent`
                       //                     and the event will not popup if `KeyEventResult.handled` is returned.
                       onChanged: handleSoftKeyboardInput,
                     ).workaroundFreezeLinuxMint(),
@@ -758,6 +767,22 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           ];
           if (showCursorPaint) {
             paints.add(CursorPaint(widget.id));
+          }
+          // fork: 移动端本地指针。触控板显示时由 FloatingMouse 自己画（跟手零延迟），
+          // 其余情况（鼠标模式、触控板被关掉、触控模式但没开虚拟鼠标）由这里补上，
+          // 否则隐藏远端光标后整屏没有指针。
+          if (isMobile) {
+            paints.add(ListenableBuilder(
+              listenable: gFFI.ffiModel.virtualMouseMode,
+              builder: (context, _) {
+                final padShowsOwnCursor = gFFI.ffiModel.touchMode &&
+                    gFFI.ffiModel.virtualMouseMode.showVirtualMouse;
+                return padShowsOwnCursor ||
+                        gFFI.inputModel.relativeMouseMode.value
+                    ? const Offstage()
+                    : const LocalCursorPaint();
+              },
+            ));
           }
           if (gFFI.ffiModel.touchMode) {
             paints.add(FloatingMouse(
@@ -951,7 +976,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             child: GestureHelp(
               touchMode: gFFI.ffiModel.touchMode,
               onTouchModeChange: (t) {
-                gFFI.ffiModel.toggleTouchMode();
+                // fork: ToggleSwitch 传进来的 t 是「目标值」，原来这里无条件
+                // toggleTouchMode() 取反，只要开关上报的 index 和模型不同步一次
+                // （比如点了已选中的那一侧），模式就会翻转成相反的那个。
+                if (gFFI.ffiModel.touchMode != t) {
+                  gFFI.ffiModel.toggleTouchMode();
+                }
                 final v = gFFI.ffiModel.touchMode ? 'Y' : 'N';
                 bind.mainSetLocalOption(key: kOptionTouchMode, value: v);
               },
@@ -974,8 +1004,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   //         title: Text(translate('Physical Keyboard Input Mode')),
   //         content: Column(mainAxisSize: MainAxisSize.min, children: [
   //           getRadio('Legacy mode', 'legacy', current, setMode),
-  //           getRadio('Map mode', 'map', current, setMode),
-  //         ]));
+  //           getRadio('Map mode', 'map', current, setMode)]));
   //   }, clickMaskDismiss: true);
   // }
 }
